@@ -1,29 +1,15 @@
-/*
-Copyright 2024 Flant JSC
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package push
 
 import (
 	"errors"
 	"fmt"
+	"github.com/deckhouse/deckhouse-cli/internal/mirror/bundle"
 	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -35,7 +21,6 @@ import (
 	"k8s.io/component-base/logs"
 	"k8s.io/kubectl/pkg/util/templates"
 
-	"github.com/deckhouse/deckhouse-cli/internal/mirror/bundle"
 	"github.com/deckhouse/deckhouse-cli/internal/mirror/contexts"
 	"github.com/deckhouse/deckhouse-cli/internal/mirror/util/auth"
 	"github.com/deckhouse/deckhouse-cli/internal/mirror/util/errorutil"
@@ -97,6 +82,8 @@ var (
 	Insecure         bool
 	TLSSkipVerify    bool
 	ImagesBundlePath string
+
+	MaxParallelPushes = 10
 )
 
 func push(_ *cobra.Command, _ []string) error {
@@ -109,8 +96,6 @@ func push(_ *cobra.Command, _ []string) error {
 		})
 	}
 
-	defer os.RemoveAll(mirrorCtx.UnpackedImagesPath)
-
 	if err := auth.ValidateWriteAccessForRepo(
 		mirrorCtx.RegistryHost+mirrorCtx.RegistryPath,
 		mirrorCtx.RegistryAuth,
@@ -122,11 +107,16 @@ func push(_ *cobra.Command, _ []string) error {
 		}
 	}
 
-	err := log.Process("mirror", "Unpacking Deckhouse bundle", func() error {
-		return bundle.Unpack(&mirrorCtx.BaseContext)
-	})
+	_, err := os.Stat(mirrorCtx.UnpackedImagesPath)
 	if err != nil {
-		return err
+		if os.IsNotExist(err) {
+			err := log.Process("mirror", "Unpacking Deckhouse bundle", func() error {
+				return bundle.Unpack(&mirrorCtx.BaseContext)
+			})
+			if err != nil {
+				return err
+			}
+		}
 	}
 
 	err = log.Process("mirror", "Push Deckhouse images to registry", func() error {
@@ -148,7 +138,7 @@ func buildPushContext() *contexts.PushContext {
 			RegistryHost:          RegistryHost,
 			RegistryPath:          RegistryPath,
 			BundlePath:            ImagesBundlePath,
-			UnpackedImagesPath:    filepath.Join(TempDir, time.Now().Format("mirror_tmp_02-01-2006_15-04-05")),
+			UnpackedImagesPath:    filepath.Join(TempDir, "unpacked"),
 		},
 	}
 	return mirrorCtx
@@ -164,56 +154,23 @@ func PushDeckhouseToRegistry(mirrorCtx *contexts.PushContext) error {
 
 	refOpts, remoteOpts := auth.MakeRemoteRegistryRequestOptionsFromMirrorContext(&mirrorCtx.BaseContext)
 
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, MaxParallelPushes) // канал семафора для ограничения числа параллельных горутин
+
 	for originalRepo, ociLayout := range ociLayouts {
-		log.InfoLn("Mirroring", originalRepo)
-		index, err := ociLayout.ImageIndex()
-		if err != nil {
-			return fmt.Errorf("read image index from %s: %w", ociLayout, err)
-		}
-
-		indexManifest, err := index.IndexManifest()
-		if err != nil {
-			return fmt.Errorf("read index manifest: %w", err)
-		}
-
-		repo := strings.Replace(originalRepo, mirrorCtx.DeckhouseRegistryRepo, mirrorCtx.RegistryHost+mirrorCtx.RegistryPath, 1)
-		pushCount := 1
-		for _, manifest := range indexManifest.Manifests {
-			tag := manifest.Annotations["io.deckhouse.image.short_tag"]
-			imageRef := repo + ":" + tag
-
-			img, err := index.Image(manifest.Digest)
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(originalRepo string, ociLayout layout.Path) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			err := pushRepo(originalRepo, ociLayout, mirrorCtx, refOpts, remoteOpts)
 			if err != nil {
-				return fmt.Errorf("read image: %w", err)
+				log.ErrorF("Error pushing %s: %v\n", originalRepo, err)
 			}
-
-			ref, err := name.ParseReference(imageRef, refOpts...)
-			if err != nil {
-				return fmt.Errorf("parse oci layout reference: %w", err)
-			}
-
-			err = retry.NewLoop(
-				fmt.Sprintf("[%d / %d] Pushing image %s...", pushCount, len(indexManifest.Manifests), imageRef),
-				20,
-				3*time.Second,
-			).Run(func() error {
-				if err = remote.Write(ref, img, remoteOpts...); err != nil {
-					if errorutil.IsTrivyMediaTypeNotAllowedError(err) {
-						log.WarnLn(errorutil.CustomTrivyMediaTypesWarning)
-						os.Exit(1)
-					}
-					return fmt.Errorf("write %s to registry: %w", ref.String(), err)
-				}
-				return nil
-			})
-			if err != nil {
-				return err
-			}
-
-			pushCount++
-		}
-		log.InfoF("Repo %s is mirrored ✅\n", originalRepo)
+		}(originalRepo, ociLayout)
 	}
+
+	wg.Wait()
 
 	log.InfoLn("All repositories are mirrored ✅")
 
@@ -227,6 +184,58 @@ func PushDeckhouseToRegistry(mirrorCtx *contexts.PushContext) error {
 	}
 	log.InfoF("All modules tags are pushed ✅\n")
 
+	return nil
+}
+
+func pushRepo(originalRepo string, ociLayout layout.Path, mirrorCtx *contexts.PushContext, refOpts []name.Option, remoteOpts []remote.Option) error {
+	log.InfoLn("Mirroring", originalRepo)
+	index, err := ociLayout.ImageIndex()
+	if err != nil {
+		return fmt.Errorf("read image index from %s: %w", ociLayout, err)
+	}
+
+	indexManifest, err := index.IndexManifest()
+	if err != nil {
+		return fmt.Errorf("read index manifest: %w", err)
+	}
+
+	repo := strings.Replace(originalRepo, mirrorCtx.DeckhouseRegistryRepo, mirrorCtx.RegistryHost+mirrorCtx.RegistryPath, 1)
+	pushCount := 1
+	for _, manifest := range indexManifest.Manifests {
+		tag := manifest.Annotations["io.deckhouse.image.short_tag"]
+		imageRef := repo + ":" + tag
+
+		img, err := index.Image(manifest.Digest)
+		if err != nil {
+			return fmt.Errorf("read image: %w", err)
+		}
+
+		ref, err := name.ParseReference(imageRef, refOpts...)
+		if err != nil {
+			return fmt.Errorf("parse oci layout reference: %w", err)
+		}
+
+		err = retry.NewLoop(
+			fmt.Sprintf("[%d / %d] Pushing image %s...", pushCount, len(indexManifest.Manifests), imageRef),
+			20,
+			3*time.Second,
+		).Run(func() error {
+			if err = remote.Write(ref, img, remoteOpts...); err != nil {
+				if errorutil.IsTrivyMediaTypeNotAllowedError(err) {
+					log.WarnLn(errorutil.CustomTrivyMediaTypesWarning)
+					os.Exit(1)
+				}
+				return fmt.Errorf("write %s to registry: %w", ref.String(), err)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+
+		pushCount++
+	}
+	log.InfoF("Repo %s is mirrored ✅\n", originalRepo)
 	return nil
 }
 
