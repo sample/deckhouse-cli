@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/layout"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
@@ -52,9 +53,9 @@ func NewCommand() *cobra.Command {
 		SilenceUsage:  true,
 		PreRunE:       parseAndValidateParameters,
 		RunE:          push,
-		PostRunE: func(_ *cobra.Command, _ []string) error {
-			return os.RemoveAll(TempDir)
-		},
+		//PostRunE: func(_ *cobra.Command, _ []string) error {
+		//	return os.RemoveAll(TempDir)
+		//},
 	}
 
 	addFlags(pushCmd.Flags())
@@ -83,7 +84,8 @@ var (
 	TLSSkipVerify    bool
 	ImagesBundlePath string
 
-	MaxParallelPushes = 10
+	MaxParallelPushes      = 2  // Настраиваемое ограничение на количество параллельных пушей
+	MaxParallelLayerPushes = 10 // Настраиваемое ограничение на количество параллельных пушей слоев
 )
 
 func push(_ *cobra.Command, _ []string) error {
@@ -201,40 +203,60 @@ func pushRepo(originalRepo string, ociLayout layout.Path, mirrorCtx *contexts.Pu
 
 	repo := strings.Replace(originalRepo, mirrorCtx.DeckhouseRegistryRepo, mirrorCtx.RegistryHost+mirrorCtx.RegistryPath, 1)
 	pushCount := 1
+	var mu sync.Mutex
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, MaxParallelLayerPushes) // канал семафора для ограничения числа параллельных пушей слоев
+
 	for _, manifest := range indexManifest.Manifests {
-		tag := manifest.Annotations["io.deckhouse.image.short_tag"]
-		imageRef := repo + ":" + tag
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(manifest v1.Descriptor) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			tag := manifest.Annotations["io.deckhouse.image.short_tag"]
+			imageRef := repo + ":" + tag
 
-		img, err := index.Image(manifest.Digest)
-		if err != nil {
-			return fmt.Errorf("read image: %w", err)
-		}
-
-		ref, err := name.ParseReference(imageRef, refOpts...)
-		if err != nil {
-			return fmt.Errorf("parse oci layout reference: %w", err)
-		}
-
-		err = retry.NewLoop(
-			fmt.Sprintf("[%d / %d] Pushing image %s...", pushCount, len(indexManifest.Manifests), imageRef),
-			20,
-			3*time.Second,
-		).Run(func() error {
-			if err = remote.Write(ref, img, remoteOpts...); err != nil {
-				if errorutil.IsTrivyMediaTypeNotAllowedError(err) {
-					log.WarnLn(errorutil.CustomTrivyMediaTypesWarning)
-					os.Exit(1)
-				}
-				return fmt.Errorf("write %s to registry: %w", ref.String(), err)
+			img, err := index.Image(manifest.Digest)
+			if err != nil {
+				log.ErrorF("read image: %v\n", err)
+				return
 			}
-			return nil
-		})
-		if err != nil {
-			return err
-		}
 
-		pushCount++
+			ref, err := name.ParseReference(imageRef, refOpts...)
+			if err != nil {
+				log.ErrorF("parse oci layout reference: %v\n", err)
+				return
+			}
+
+			err = retry.NewLoop(
+				fmt.Sprintf("[%d / %d] Pushing image %s...", pushCount, len(indexManifest.Manifests), imageRef),
+				20,
+				3*time.Second,
+			).Run(func() error {
+				if err = remote.Write(ref, img, remoteOpts...); err != nil {
+					if errorutil.IsTrivyMediaTypeNotAllowedError(err) {
+						log.WarnLn(errorutil.CustomTrivyMediaTypesWarning)
+						os.Exit(1)
+					}
+					return fmt.Errorf("write %s to registry: %w", ref.String(), err)
+				}
+				return nil
+			})
+			if err != nil {
+				log.ErrorF("Error pushing image %s: %v\n", imageRef, err)
+				return
+			}
+
+			log.InfoF("Image %s pushed successfully ✅\n", imageRef)
+			mu.Lock()
+			pushCount++
+			mu.Unlock()
+		}(manifest)
 	}
+
+	wg.Wait()
+
 	log.InfoF("Repo %s is mirrored ✅\n", originalRepo)
 	return nil
 }
